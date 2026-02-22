@@ -1,7 +1,7 @@
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from logging import getLogger
-from threading import Lock, Condition
+from threading import Lock, Condition, Event
 
 import numpy as np
 import cchess_alphazero.environment.static_env as senv
@@ -60,7 +60,8 @@ class CChessPlayer:
         self.buffer_planes = []         # prediction queue
         self.buffer_history = []
 
-        self.all_done = Lock()
+        self.all_done = Event()
+        self.all_done.set()
         self.num_task = 0
 
         self.job_done = False
@@ -73,8 +74,7 @@ class CChessPlayer:
         self.job_done = True
         with self.q_cond:
             self.q_cond.notify_all()
-        if self.all_done.locked():
-            self.all_done.release()
+        self.all_done.set()
         if self.executor is not None:
             try:
                 self.executor.shutdown(wait=True, cancel_futures=True)
@@ -148,34 +148,43 @@ class CChessPlayer:
     def action(self, state, turns, no_act=None) -> str:
         if self.job_done:
             return None, [0.0] * self.labels_n
-        self.all_done.acquire(True)
-        try:
-            self.root_state = state
-            done = 0
-            if state in self.tree:
-                done = self.tree[state].sum_n
-            self.num_task = self.play_config.simulation_num_per_move - done
+        self.root_state = state
+        done = 0
+        if state in self.tree:
+            done = self.tree[state].sum_n
+        total_tasks = self.play_config.simulation_num_per_move - done
 
-            # MCTS search
-            if self.num_task > 0 and not self.job_done:
-                # logger.debug(f"all_task = {self.num_task}")
-                all_tasks = self.num_task
-                batch = all_tasks // self.config.play.search_threads
-                if all_tasks % self.config.play.search_threads != 0:
-                    batch += 1
-                for iter in range(batch):
-                    if self.job_done:
-                        break
-                    self.num_task = min(self.config.play.search_threads, all_tasks - self.config.play.search_threads * iter)
-                    # logger.debug(f"iter = {iter}, num_task = {self.num_task}")
-                    for i in range(self.num_task):
+        # MCTS search
+        if total_tasks > 0 and not self.job_done:
+            batch = total_tasks // self.config.play.search_threads
+            if total_tasks % self.config.play.search_threads != 0:
+                batch += 1
+            for iter in range(batch):
+                if self.job_done:
+                    break
+                task_count = min(self.config.play.search_threads, total_tasks - self.config.play.search_threads * iter)
+                if task_count <= 0:
+                    break
+                with self.t_lock:
+                    self.num_task = task_count
+                self.all_done.clear()
+                submitted = 0
+                for i in range(task_count):
+                    try:
                         self.executor.submit(self.MCTS_search, state, [state], True)
-                    self.all_done.acquire(True)
-            if self.job_done:
-                return None, [0.0] * self.labels_n
-        finally:
-            if self.all_done.locked():
-                self.all_done.release()
+                        submitted += 1
+                    except RuntimeError:
+                        self.job_done = True
+                        break
+                if submitted <= 0:
+                    self.all_done.set()
+                    break
+                if not self.all_done.wait(timeout=30.0):
+                    logger.error("MCTS batch timed out, stop current player worker")
+                    self.job_done = True
+                    break
+        if self.job_done:
+            return None, [0.0] * self.labels_n
 
         policy, resign = self.calc_policy(state, turns)
 
@@ -352,8 +361,8 @@ class CChessPlayer:
         with self.t_lock:
             self.num_task -= 1
             # logger.debug(f"finish 1, remain num task = {self.num_task}")
-            if self.num_task <= 0 and self.all_done.locked():
-                self.all_done.release()
+            if self.num_task <= 0:
+                self.all_done.set()
 
     def calc_policy(self, state, turns) -> np.ndarray:
         '''
