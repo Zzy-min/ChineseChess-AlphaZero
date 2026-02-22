@@ -73,14 +73,22 @@ class CChessPlayer:
         self.job_done = True
         with self.q_cond:
             self.q_cond.notify_all()
+        if self.all_done.locked():
+            self.all_done.release()
         if self.executor is not None:
-            self.executor.shutdown()
+            try:
+                self.executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                self.executor.shutdown(wait=True)
 
     def sender(self):
         '''
         send planes to neural network for prediction
         '''
         limit = 256                 # max prediction queue size
+        if self.pipe is None:
+            self.job_done = True
+            return
         while not self.job_done:
             with self.q_cond:
                 while not self.job_done and len(self.buffer_history) == 0:
@@ -103,6 +111,9 @@ class CChessPlayer:
         '''
         receive policy and value from neural network
         '''
+        if self.pipe is None:
+            self.job_done = True
+            return
         while not self.job_done:
             try:
                 if not self.pipe.poll(0.001):
@@ -126,30 +137,45 @@ class CChessPlayer:
             for i in range(k):
                 ret = rets[i]
                 # logger.debug(f"NN ret, update tree buffer_history = {histories[i]}")
-                self.executor.submit(self.update_tree, ret[0], ret[1], histories[i])
+                try:
+                    self.executor.submit(self.update_tree, ret[0], ret[1], histories[i])
+                except RuntimeError:
+                    self.job_done = True
+                    with self.q_cond:
+                        self.q_cond.notify_all()
+                    return
 
     def action(self, state, turns, no_act=None) -> str:
+        if self.job_done:
+            return None, [0.0] * self.labels_n
         self.all_done.acquire(True)
-        self.root_state = state
-        done = 0
-        if state in self.tree:
-            done = self.tree[state].sum_n
-        self.num_task = self.play_config.simulation_num_per_move - done
+        try:
+            self.root_state = state
+            done = 0
+            if state in self.tree:
+                done = self.tree[state].sum_n
+            self.num_task = self.play_config.simulation_num_per_move - done
 
-        # MCTS search
-        if self.num_task > 0:
-            # logger.debug(f"all_task = {self.num_task}")
-            all_tasks = self.num_task
-            batch = all_tasks // self.config.play.search_threads
-            if all_tasks % self.config.play.search_threads != 0:
-                batch += 1
-            for iter in range(batch):
-                self.num_task = min(self.config.play.search_threads, all_tasks - self.config.play.search_threads * iter)
-                # logger.debug(f"iter = {iter}, num_task = {self.num_task}")
-                for i in range(self.num_task):
-                    self.executor.submit(self.MCTS_search, state, [state], True)
-                self.all_done.acquire(True)
-        self.all_done.release()
+            # MCTS search
+            if self.num_task > 0 and not self.job_done:
+                # logger.debug(f"all_task = {self.num_task}")
+                all_tasks = self.num_task
+                batch = all_tasks // self.config.play.search_threads
+                if all_tasks % self.config.play.search_threads != 0:
+                    batch += 1
+                for iter in range(batch):
+                    if self.job_done:
+                        break
+                    self.num_task = min(self.config.play.search_threads, all_tasks - self.config.play.search_threads * iter)
+                    # logger.debug(f"iter = {iter}, num_task = {self.num_task}")
+                    for i in range(self.num_task):
+                        self.executor.submit(self.MCTS_search, state, [state], True)
+                    self.all_done.acquire(True)
+            if self.job_done:
+                return None, [0.0] * self.labels_n
+        finally:
+            if self.all_done.locked():
+                self.all_done.release()
 
         policy, resign = self.calc_policy(state, turns)
 
@@ -162,10 +188,14 @@ class CChessPlayer:
         my_action = int(np.random.choice(range(self.labels_n), p=self.apply_temperature(policy, turns)))
         return self.labels[my_action], list(policy)
 
-    def MCTS_search(self, state, history=[], is_root_node=False) -> float:
+    def MCTS_search(self, state, history=None, is_root_node=False) -> float:
         """
         Monte Carlo Tree Search
         """
+        if history is None:
+            history = [state]
+        else:
+            history = list(history)
         while True:
             # logger.debug(f"start MCTS, state = {state}, history = {history}")
             game_over, v, _ = senv.done(state)
@@ -284,6 +314,8 @@ class CChessPlayer:
             # logger.debug(f"EAE append buffer_history history = {history}")
 
     def update_tree(self, p, v, history):
+        if not history:
+            return
         state = history.pop()
         z = v
 
@@ -350,7 +382,11 @@ class CChessPlayer:
                 if mov in debug_result:
                     self.search_results[mov] = debug_result[mov]
 
-        policy /= np.sum(policy)
+        total = np.sum(policy)
+        if total <= 0:
+            policy[:] = 1.0 / self.labels_n
+        else:
+            policy /= total
         return policy, False
 
     def apply_temperature(self, policy, turn) -> np.ndarray:

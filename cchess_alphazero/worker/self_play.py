@@ -1,6 +1,5 @@
 import os
 import numpy as np
-from time import sleep
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
@@ -54,6 +53,16 @@ class SelfPlayWorker:
         self.id = pid
         self.buffer = []
         self.pid = os.getpid()
+        self.stop_requested = False
+        self.max_games = int(os.environ.get("SELF_PLAY_MAX_GAMES", "0") or 0)
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def should_stop(self, idx):
+        if self.stop_requested:
+            return True
+        return self.max_games > 0 and idx > self.max_games
 
     def start(self):
         logger.debug(f"Selfplay#Start Process index = {self.id}, pid = {self.pid}")
@@ -62,101 +71,119 @@ class SelfPlayWorker:
         self.buffer = []
         search_tree = defaultdict(VisitState)
 
-        while True:
+        while not self.should_stop(idx):
             start_time = time()
-            value, turns, state, search_tree, store = self.start_game(idx, search_tree)
-            end_time = time()
-            logger.debug(f"Process {self.pid}-{self.id} play game {idx} time={(end_time - start_time):.1f} sec, "
-                         f"turn={turns / 2}, winner = {value:.2f} (1 = red, -1 = black, 0 draw)")
-            if turns <= 10:
-                senv.render(state)
-            if store:
-                idx += 1
+            try:
+                value, turns, state, search_tree, store = self.start_game(idx, search_tree)
+                end_time = time()
+                logger.debug(f"Process {self.pid}-{self.id} play game {idx} time={(end_time - start_time):.1f} sec, "
+                             f"turn={turns / 2}, winner = {value:.2f} (1 = red, -1 = black, 0 draw)")
+                if turns <= 10:
+                    senv.render(state)
+                if store:
+                    idx += 1
+            except KeyboardInterrupt:
+                self.request_stop()
+                break
+            except Exception as e:
+                logger.exception(f"Selfplay worker {self.pid}-{self.id} failed in game loop: {e}")
+                sleep(0.2)
+        if self.player is not None:
+            self.player.close()
+            self.player = None
 
     def start_game(self, idx, search_tree):
+        pipes = None
+        if self.cur_pipes is None:
+            raise RuntimeError("self.cur_pipes is None")
+        wait_count = 0
+        while not self.stop_requested and len(self.cur_pipes) <= 0:
+            sleep(0.01)
+            wait_count += 1
+            if wait_count % 500 == 0:
+                logger.warning(f"Worker {self.pid}-{self.id} waiting for available pipe...")
+        if self.stop_requested:
+            return 0, 0, senv.INIT_STATE, search_tree, False
         pipes = self.cur_pipes.pop()
 
-        if not self.config.play.share_mtcs_info_in_self_play or \
-            idx % self.config.play.reset_mtcs_info_per_game == 0:
-            search_tree = defaultdict(VisitState)
+        try:
+            if not self.config.play.share_mtcs_info_in_self_play or \
+                idx % self.config.play.reset_mtcs_info_per_game == 0:
+                search_tree = defaultdict(VisitState)
 
-        if random() > self.config.play.enable_resign_rate:
-            enable_resign = True
-        else:
-            enable_resign = False
-
-        self.player = CChessPlayer(self.config, search_tree=search_tree, pipes=pipes, enable_resign=enable_resign, debugging=False)
-
-        state = senv.INIT_STATE
-        history = [state]
-        policys = [] 
-        value = 0
-        turns = 0       # even == red; odd == black
-        game_over = False
-        final_move = None
-
-        while not game_over:
-            no_act = None
-            if state in history[:-1]:
-                no_act = []
-                for i in range(len(history) - 1):
-                    if history[i] == state:
-                        no_act.append(history[i + 1])
-            start_time = time()
-            action, policy = self.player.action(state, turns, no_act)
-            end_time = time()
-            if action is None:
-                logger.debug(f"{turns % 2} (0 = red; 1 = black) has resigned!")
-                value = -1
-                break
-            # logger.debug(f"Process{self.pid} Playing: {turns % 2}, action: {action}, time: {(end_time - start_time):.1f}s")
-            # for move, action_state in self.player.search_results.items():
-            #     if action_state[0] >= 20:
-            #         logger.info(f"move: {move}, prob: {action_state[0]}, Q_value: {action_state[1]:.2f}, Prior: {action_state[2]:.3f}")
-            # self.player.search_results = {}
-            history.append(action)
-            policys.append(policy)
-            state = senv.step(state, action)
-            turns += 1
-            history.append(state)
-
-            if turns / 2 >= self.config.play.max_game_length:
-                game_over = True
-                value = senv.evaluate(state)
+            if random() > self.config.play.enable_resign_rate:
+                enable_resign = True
             else:
-                game_over, value, final_move = senv.done(state)
+                enable_resign = False
 
-        if final_move:
-            policy = self.build_policy(final_move, False)
-            history.append(final_move)
-            policys.append(policy)
-            state = senv.step(state, final_move)
-            history.append(state)
+            self.player = CChessPlayer(self.config, search_tree=search_tree, pipes=pipes, enable_resign=enable_resign, debugging=False)
 
-        self.player.close()
-        if turns % 2 == 1:  # balck turn
-            value = -value
+            state = senv.INIT_STATE
+            history = [state]
+            policys = []
+            value = 0
+            turns = 0       # even == red; odd == black
+            game_over = False
+            final_move = None
 
-        v = value
-        if v == 0:
-            if random() > 0.5:
-                store = True
-            else:
-                store = False
-        else:
-            store = True
+            while not game_over and not self.stop_requested:
+                no_act = None
+                if state in history[:-1]:
+                    no_act = []
+                    for i in range(len(history) - 1):
+                        if history[i] == state:
+                            no_act.append(history[i + 1])
+                action, policy = self.player.action(state, turns, no_act)
+                if action is None:
+                    logger.debug(f"{turns % 2} (0 = red; 1 = black) has resigned!")
+                    value = -1
+                    break
+                history.append(action)
+                policys.append(policy)
+                state = senv.step(state, action)
+                turns += 1
+                history.append(state)
 
-        if store:
-            data = []
-            for i in range(turns):
-                k = i * 2
-                data.append([history[k], policys[i], value])
+                if turns / 2 >= self.config.play.max_game_length:
+                    game_over = True
+                    value = senv.evaluate(state)
+                else:
+                    game_over, value, final_move = senv.done(state)
+
+            if final_move and not self.stop_requested:
+                policy = self.build_policy(final_move, False)
+                history.append(final_move)
+                policys.append(policy)
+                state = senv.step(state, final_move)
+                history.append(state)
+
+            if turns % 2 == 1:  # balck turn
                 value = -value
-            self.save_play_data(idx, data)
 
-        self.cur_pipes.append(pipes)
-        self.remove_play_data()
-        return v, turns, state, search_tree, store
+            v = value
+            if self.stop_requested:
+                store = False
+            elif v == 0:
+                store = random() > 0.5
+            else:
+                store = True
+
+            if store:
+                data = []
+                for i in range(turns):
+                    k = i * 2
+                    data.append([history[k], policys[i], value])
+                    value = -value
+                self.save_play_data(idx, data)
+
+            self.remove_play_data()
+            return v, turns, state, search_tree, store
+        finally:
+            if self.player is not None:
+                self.player.close()
+                self.player = None
+            if pipes is not None:
+                self.cur_pipes.append(pipes)
 
     def save_play_data(self, idx, data):
         self.buffer += data
