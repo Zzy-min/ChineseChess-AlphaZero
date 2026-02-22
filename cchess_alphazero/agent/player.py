@@ -7,7 +7,7 @@ import numpy as np
 import cchess_alphazero.environment.static_env as senv
 from cchess_alphazero.config import Config
 from cchess_alphazero.environment.lookup_tables import Winner, ActionLabelsRed
-from time import time, sleep
+from time import time
 
 logger = getLogger(__name__)
 
@@ -54,8 +54,8 @@ class CChessPlayer:
         self.debug = {}
 
         self.s_lock = Lock()
-        self.run_lock = Lock()
         self.q_lock = Lock()            # queue lock
+        self.q_cond = Condition(self.q_lock)
         self.t_lock = Lock()
         self.buffer_planes = []         # prediction queue
         self.buffer_history = []
@@ -71,6 +71,8 @@ class CChessPlayer:
 
     def close(self):
         self.job_done = True
+        with self.q_cond:
+            self.q_cond.notify_all()
         if self.executor is not None:
             self.executor.shutdown()
 
@@ -80,36 +82,51 @@ class CChessPlayer:
         '''
         limit = 256                 # max prediction queue size
         while not self.job_done:
-            self.run_lock.acquire()
-            with self.q_lock:
+            with self.q_cond:
+                while not self.job_done and len(self.buffer_history) == 0:
+                    self.q_cond.wait(timeout=0.05)
+                if self.job_done:
+                    return
                 l = min(limit, len(self.buffer_history))
-                if l > 0:
-                    t_data = self.buffer_planes[0:l]
-                    # logger.debug(f"send queue size = {l}")
-                    self.pipe.send(t_data)
-                else:
-                    self.run_lock.release()
-                    sleep(0.001)
+                t_data = self.buffer_planes[0:l]
+            try:
+                # logger.debug(f"send queue size = {l}")
+                self.pipe.send(t_data)
+            except Exception as e:
+                logger.exception("sender failed to send batch: %s", e)
+                self.job_done = True
+                with self.q_cond:
+                    self.q_cond.notify_all()
+                return
 
     def receiver(self):
         '''
         receive policy and value from neural network
         '''
         while not self.job_done:
-            if self.pipe.poll(0.001):
+            try:
+                if not self.pipe.poll(0.001):
+                    continue
                 rets = self.pipe.recv()
-            else:
-                continue
-            k = 0
-            with self.q_lock:
-                for ret in rets:
-                    # logger.debug(f"NN ret, update tree buffer_history = {self.buffer_history}")
-                    self.executor.submit(self.update_tree, ret[0], ret[1], self.buffer_history[k])
-                    # self.update_tree(ret[0], ret[1], self.buffer_history[k])
-                    k = k + 1
+            except Exception as e:
+                logger.exception("receiver failed to get batch: %s", e)
+                self.job_done = True
+                with self.q_cond:
+                    self.q_cond.notify_all()
+                return
+
+            with self.q_cond:
+                k = min(len(rets), len(self.buffer_history))
+                if k <= 0:
+                    continue
+                histories = self.buffer_history[:k]
                 self.buffer_planes = self.buffer_planes[k:]
                 self.buffer_history = self.buffer_history[k:]
-            self.run_lock.release()
+
+            for i in range(k):
+                ret = rets[i]
+                # logger.debug(f"NN ret, update tree buffer_history = {histories[i]}")
+                self.executor.submit(self.update_tree, ret[0], ret[1], histories[i])
 
     def action(self, state, turns, no_act=None) -> str:
         self.all_done.acquire(True)
@@ -260,9 +277,10 @@ class CChessPlayer:
         Evaluate the state, return its policy and value computed by neural network
         '''
         state_planes = senv.state_to_planes(state)
-        with self.q_lock:
+        with self.q_cond:
             self.buffer_planes.append(state_planes)
             self.buffer_history.append(history)
+            self.q_cond.notify()
             # logger.debug(f"EAE append buffer_history history = {history}")
 
     def update_tree(self, p, v, history):
@@ -302,7 +320,7 @@ class CChessPlayer:
         with self.t_lock:
             self.num_task -= 1
             # logger.debug(f"finish 1, remain num task = {self.num_task}")
-            if self.num_task <= 0:
+            if self.num_task <= 0 and self.all_done.locked():
                 self.all_done.release()
 
     def calc_policy(self, state, turns) -> np.ndarray:
