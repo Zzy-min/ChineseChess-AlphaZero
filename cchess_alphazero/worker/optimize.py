@@ -182,8 +182,8 @@ class OptimizeWorker:
         for i in range(3):
             remote_server = 'root@115.159.183.150'
             remote_path = '/var/www/alphazero.52coding.com.cn/data/model'
-            cmd = f'scp {self.config.resource.model_best_weight_path} {remote_server}:{remote_path}'
-            ret = subprocess.run(cmd, shell=True)
+            cmd = ['scp', self.config.resource.model_best_weight_path, f'{remote_server}:{remote_path}']
+            ret = subprocess.run(cmd, check=False)
             if ret.returncode == 0:
                 success = True
                 logger.info("Send model success!")
