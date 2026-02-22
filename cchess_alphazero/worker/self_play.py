@@ -64,14 +64,32 @@ class SelfPlayWorker:
             return True
         return self.max_games > 0 and idx > self.max_games
 
+    def acquire_pipe(self):
+        if self.cur_pipes is None:
+            raise RuntimeError("self.cur_pipes is None")
+        wait_count = 0
+        while not self.stop_requested:
+            try:
+                return self.cur_pipes.pop()
+            except IndexError:
+                sleep(0.01)
+                wait_count += 1
+                if wait_count % 500 == 0:
+                    logger.warning(f"Worker {self.pid}-{self.id} waiting for available pipe...")
+            except Exception as e:
+                logger.warning(f"Worker {self.pid}-{self.id} failed to acquire pipe once: {e}")
+                sleep(0.01)
+        return None
+
     def start(self):
         logger.debug(f"Selfplay#Start Process index = {self.id}, pid = {self.pid}")
 
         idx = 1
+        played_games = 0
         self.buffer = []
         search_tree = defaultdict(VisitState)
 
-        while not self.should_stop(idx):
+        while not self.should_stop(played_games + 1):
             start_time = time()
             try:
                 value, turns, state, search_tree, store = self.start_game(idx, search_tree)
@@ -80,8 +98,8 @@ class SelfPlayWorker:
                              f"turn={turns / 2}, winner = {value:.2f} (1 = red, -1 = black, 0 draw)")
                 if turns <= 10:
                     senv.render(state)
-                if store:
-                    idx += 1
+                idx += 1
+                played_games += 1
             except KeyboardInterrupt:
                 self.request_stop()
                 break
@@ -93,18 +111,9 @@ class SelfPlayWorker:
             self.player = None
 
     def start_game(self, idx, search_tree):
-        pipes = None
-        if self.cur_pipes is None:
-            raise RuntimeError("self.cur_pipes is None")
-        wait_count = 0
-        while not self.stop_requested and len(self.cur_pipes) <= 0:
-            sleep(0.01)
-            wait_count += 1
-            if wait_count % 500 == 0:
-                logger.warning(f"Worker {self.pid}-{self.id} waiting for available pipe...")
-        if self.stop_requested:
+        pipes = self.acquire_pipe()
+        if self.stop_requested or pipes is None:
             return 0, 0, senv.INIT_STATE, search_tree, False
-        pipes = self.cur_pipes.pop()
 
         try:
             if not self.config.play.share_mtcs_info_in_self_play or \
@@ -183,7 +192,10 @@ class SelfPlayWorker:
                 self.player.close()
                 self.player = None
             if pipes is not None:
-                self.cur_pipes.append(pipes)
+                try:
+                    self.cur_pipes.append(pipes)
+                except Exception as e:
+                    logger.warning(f"Worker {self.pid}-{self.id} failed to release pipe: {e}")
 
     def save_play_data(self, idx, data):
         self.buffer += data
