@@ -29,6 +29,14 @@ class CChessModel:
         self.graph = None
         self.api = None
 
+    @staticmethod
+    def _default_graph():
+        # Keep TF1-style graph context support for existing API code,
+        # while remaining compatible with TF2 runtimes.
+        if hasattr(tf, "compat") and hasattr(tf.compat, "v1"):
+            return tf.compat.v1.get_default_graph()
+        return tf.get_default_graph()
+
     def build(self):
         mc = self.config.model
         in_x = x = Input((14, 10, 9)) # 14 x 10 x 9
@@ -63,7 +71,7 @@ class CChessModel:
         value_out = Dense(1, kernel_regularizer=l2(mc.l2_reg), activation="tanh", name="value_out")(x)
 
         self.model = Model(in_x, [policy_out, value_out], name="cchess_model")
-        self.graph = tf.get_default_graph()
+        self.graph = self._default_graph()
 
     def _build_residual_block(self, x, index):
         mc = self.config.model
@@ -87,7 +95,8 @@ class CChessModel:
         if os.path.exists(weight_path):
             m = hashlib.sha256()
             with open(weight_path, "rb") as f:
-                m.update(f.read())
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    m.update(chunk)
             return m.hexdigest()
 
 
@@ -98,7 +107,7 @@ class CChessModel:
                 self.model = Model.from_config(json.load(f))
             self.model.load_weights(weight_path)
             self.digest = self.fetch_digest(weight_path)
-            self.graph = tf.get_default_graph()
+            self.graph = self._default_graph()
             logger.debug(f"loaded model digest = {self.digest}")
             return True
         else:
