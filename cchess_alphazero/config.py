@@ -2,8 +2,7 @@ import os
 import getpass
 
 def _project_dir():
-    d = os.path.dirname
-    return d(d(os.path.abspath(__file__)))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _data_dir():
